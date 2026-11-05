@@ -4,7 +4,7 @@ meta:
   provider: "MiniMax"
   description: "MiniMax M3.1-Flash vision-language MoE (~428B total / 23B active) with MSA sparse attention throughout and a built-in DSpark draft; quantization-aware trained, MXFP8 dense layers and NVFP4 experts. Served TP4 on NVIDIA Blackwell or AMD MI355X, prefill/decode disaggregated as TP4 + TP4 on MI355X or DEP2 + DEP4 on GB200/GB300, and TP8 on NVIDIA Hopper."
   date_added: 2026-10-23
-  date_updated: 2026-10-30
+  date_updated: 2026-11-05
   tasks:
     - text
     - multimodal
@@ -207,8 +207,8 @@ variants:
     vram_minimum_gb: 293
     description: "AMD Quark export: routed experts stored in OCP MXFP4 and run as W4A4 on the AITER MoE, with NVFP4 KV and indexer K caches. MI355X only."
     hardware_overrides:
-      # The export's recommended MoE setup; the shared expert stays a separate
-      # MXFP8 MLP (no shared-expert fusion).
+      # The baseline keeps the shared expert as a separate MXFP8 MLP. The
+      # AgentX preset overrides this with shared-only MXFP4 conversion at c1-c32.
       amd:
         extra_args:
           - "--moe-backend"
@@ -1385,16 +1385,19 @@ presets:
     strategy: single_node_tp
     variants: [mxfp4]
     workload: "Agentic (InferenceX AgentX)"
-    description: "One TP4 engine on four of the node's eight MI355X GPUs, serving the Quark MXFP4 checkpoint: seven-token DSpark with mono decode and an FP8 KV cache up to concurrency 8, seven-token DSpark with DBO and an NVFP4 KV cache at 16 and 32, and three-token DSpark with DBO and a host-DRAM KV tier at 64."
-    source: { label: "InferenceX #4671", href: "https://github.com/SemiAnalysisAI/InferenceX/pull/4671", key: "minimaxm31flash-fp4-mi355x-vllm-agentic-dspark", revision: a328b443582c45e45eef7f0c4f133f3e173f0211 }
+    description: "One TP4 engine on four of the node's eight MI355X GPUs, serving the Quark MXFP4 checkpoint: shared experts converted to MXFP4 and fused at concurrency 1-32, seven-token DSpark with mono decode and an FP8 KV cache up to concurrency 8, and seven-token DSpark with DBO and an NVFP4 KV cache at 16 and 32. Concurrency 64 keeps separate MXFP8 shared experts, three-token DSpark, DBO and a host-DRAM KV tier."
+    source: { label: "InferenceX #4671 (base configuration)", href: "https://github.com/SemiAnalysisAI/InferenceX/pull/4671", key: "minimaxm31flash-fp4-mi355x-vllm-agentic-dspark", revision: a328b443582c45e45eef7f0c4f133f3e173f0211 }
     image: "vllm/vllm-openai-rocm:minimax-m31-flash@sha256:ae8681212aa5291d8c27f06e90016435e3fca144a68fd5c439231f6475f74569"
     tp: 4
     select:
       features: { text_only: true, spec_decoding: true }
     args:
       - "--enable-prefix-caching"
+      - "--quantization-config"
+      - '{"targets":{"*shared_expert*":"mxfp4"}}'
     env:
       VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "900"
+      VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: "1"
     json_args:
       "--speculative-config": { num_speculative_tokens: 7, rejection_sample_method: block }
     # The DBO points pass the DBO flags directly: the DBO / SP prefill feature's
@@ -1435,8 +1438,9 @@ presets:
         label: "64 (DBO, KV offload)"
         concurrency: 64
         select: { kv_offload: simple }
+        remove_args: ["--quantization-config"]
         args: ["--max-num-seqs", "128", "--max-num-batched-tokens", "32768", "--gpu-memory-utilization", "0.9", "--enable-dbo", "--dbo-prefill-token-threshold", "16384", "--dbo-decode-token-threshold", "32768"]
-        env: { VLLM_USE_V2_MODEL_RUNNER: "1", DEBUG_HIP_DYNAMIC_QUEUES: "0", PYTHONHASHSEED: "42" }
+        env: { VLLM_USE_V2_MODEL_RUNNER: "1", DEBUG_HIP_DYNAMIC_QUEUES: "0", PYTHONHASHSEED: "42", VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: "0" }
         json_args:
           "--speculative-config": { num_speculative_tokens: 3 }
           "--kv-transfer-config": { kv_connector_extra_config: { cpu_bytes_to_use_per_rank: null, cpu_bytes_to_use: 1349000000000, lazy_offload: false } }
@@ -1448,6 +1452,37 @@ presets:
       (c64 admits 128). Throughput runs replaced block verification with synthetic
       rejection at the committed golden DSpark acceptance length (4.04 for seven
       tokens, 2.88 for three); the commands above keep block verification.
+
+      At concurrency 1-32, the shared expert is dequantized from MXFP8 and
+      re-quantized to MXFP4 at weight load, then fused into the routed MoE as its
+      extra expert slot. Routed experts keep their stored MXFP4 weights. This
+      conversion is lossy and works with DSpark and both the mono and DBO paths;
+      it does not require `--monokernel`.
+
+      The [AMD checkpoint model card](https://huggingface.co/amd/MiniMax-M3.1-Flash-Quark-MXFP4#experimental-mxfp4-shared-experts)
+      describes shared-expert MXFP4 as experimental and does not recommend it as
+      the general default. The shared-expert settings here are a cookbook-specific
+      change to the cited InferenceX base configuration, not an InferenceX update.
+
+      Validation on 2026-11-04/05 used MI350X, TP4, this pinned image and real
+      DSpark block verification. GSM8K used 1319 fixed questions, five-shot
+      prompting, temperature 0, seed 1234, a 2048-token output limit and an identical
+      no-thinking request template. The c8 mono configuration, evaluated at
+      concurrency 2, scored 1260/1319 before and 1247/1319 after the change in one
+      pair. Five fresh-engine c32 DBO pairs, with GPU groups alternated between
+      configurations, averaged 94.981% before and 94.647% after; the paired-question
+      bootstrap 95% interval for the difference was [-0.849, +0.182] percentage
+      points. These results do not establish accuracy equivalence or validate
+      shared-expert fusion on MI355X.
+
+      Concurrency 64 retains separate MXFP8 shared experts. One MI350X pair on
+      2026-11-05 exercised CPU KV reloads in both configurations: the combined
+      change increased output throughput by 6.57% and reduced mean time per output
+      token by 13.07%, but increased mean time to first token by 8.09%. Both scored
+      1255/1319 on GSM8K, with a paired-question bootstrap 95% interval of
+      [-1.137, +1.137] percentage points for the difference. A single pair does not
+      establish stable performance gains or accuracy equivalence for the offload
+      point.
 
       - **Concurrency 1-8** run mono decode with an FP8 KV cache and no DBO: a decode
         step of up to 16 tokens runs each layer as one fused kernel, and prefill steps
@@ -1461,7 +1496,8 @@ presets:
 
       [InferenceX run 41003224750](https://github.com/SemiAnalysisAI/InferenceX/actions/runs/41003224750)
       passed all seven performance points and GSM8K at concurrency 8, 32 and 64 at
-      `a328b4435` (single run):
+      `a328b4435` (single run, separate MXFP8 shared experts; these are the
+      historical baseline results, not measurements of shared-expert fusion):
 
       | Concurrency | Interactivity p50 / p90 (tokens/s/user) | Total tokens/s per GPU |
       | --- | ---: | ---: |
